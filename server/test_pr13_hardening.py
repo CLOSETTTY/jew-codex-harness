@@ -187,6 +187,7 @@ class RelayHardeningTests(unittest.TestCase):
         sender, reader = socket.socketpair()
         try:
             sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             h = handler()
             h.connection = sender
             h.wfile = sender.makefile("wb", buffering=4096)
@@ -194,7 +195,11 @@ class RelayHardeningTests(unittest.TestCase):
             relay = ValidatedStream(h, "jev/auto")
             started = time.monotonic()
             with self.assertRaises(ClientDisconnected):
-                relay.write(b"x" * (2 * 1024 * 1024))
+                # Windows loopback may absorb megabytes despite SO_SNDBUF.
+                # Keep writing bounded chunks until the unread peer blocks.
+                chunk = b"x" * (1024 * 1024)
+                for _ in range(256):
+                    relay.write(chunk)
             self.assertLess(time.monotonic() - started, 1.5)
             self.assertTrue(relay.finished)
             h.wfile.close()

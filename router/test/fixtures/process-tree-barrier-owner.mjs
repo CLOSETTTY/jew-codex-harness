@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
@@ -58,7 +58,10 @@ if (depth > 0) {
 }
 
 await withOwnerSignalExitBarrier(async (ownerSignal) => {
-  writeFileSync(readyPath, String(process.pid));
+  // Publish readiness only once the PID is complete, not after open/truncate.
+  const readyTemporary = readyPath + ".tmp";
+  writeFileSync(readyTemporary, String(process.pid));
+  renameSync(readyTemporary, readyPath);
   await new Promise((resolve) => {
     const hold = setInterval(() => {}, 1_000);
     const finish = () => {

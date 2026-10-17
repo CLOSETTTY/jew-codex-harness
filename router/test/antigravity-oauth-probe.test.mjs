@@ -210,16 +210,24 @@ test("a valid terminal prefix cannot hide a later contradictory candidate before
       live: true,
       confirmed: true,
       endpoints: ["https://daily-cloudcode-pa.googleapis.com"],
-      fetchImpl: projectAndStreamFetch(() => delayedStreamPayloads([
-        completionPayload(),
-        {
-          candidates: [{
-            content: { parts: [] },
-            finishReason: "SAFETY",
-          }],
-        },
-        "[DONE]",
-      ], { onEmit: () => { emitted += 1; } })),
+      fetchImpl: projectAndStreamFetch(() => {
+        const payloads = [completionPayload(), {
+          candidates: [{ content: { parts: [] }, finishReason: "SAFETY" }],
+        }, "[DONE]"];
+        const encoder = new TextEncoder();
+        // Demand-driven chunks prove consumption through DONE without racing
+        // three wall-clock timers against the fixture's 25 ms terminal grace.
+        return new Response(new ReadableStream({
+          pull(controller) {
+            const payload = payloads[emitted++];
+            const data = payload === "[DONE]" ? payload : JSON.stringify(payload);
+            controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+            if (emitted === payloads.length) controller.close();
+          },
+        }, { highWaterMark: 0 }), {
+          status: 200, headers: { "Content-Type": "text/event-stream" },
+        });
+      }),
     }),
     { code: "antigravity_probe_result_mismatch" },
   );

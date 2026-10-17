@@ -19,7 +19,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "server"))
 from portable_lock import locked_file  # noqa: E402
 sys.path.insert(0, str(REPO / "integrations/workers"))
-from ownership import bound_task, patch_allowed, readonly_command  # noqa: E402
+from ownership import bound_task, owned_paths, patch_allowed, readonly_command  # noqa: E402
 STATE = Path(os.environ.get("JEV_GLOBAL_STATE_DIR", str(CODEX_HOME / "jev-global")))
 OMNIROUTE_GUIDE = str(REPO / "OMNIROUTE-AGENT-INSTRUCTIONS.md")
 OMNIROUTE_TEXT_HELPER = str(REPO / "scripts/omniroute_text.py")
@@ -449,6 +449,131 @@ def action_hint(name, value):
     return clean(name + " " + json.dumps(visible, ensure_ascii=False), 360)
 
 
+def sanitized(value):
+    """Redact credential-shaped values without truncating task authority."""
+    return SECRET_RX.sub("[redacted]", str(value or ""))
+
+
+def verified_worker_task():
+    """Reload and validate the environment-bound manifest before provider review."""
+    task = bound_task()
+    commands = task.get("acceptance_commands", []) if isinstance(task, dict) else None
+    instructions = task.get("mandatory_instructions", "") if isinstance(task, dict) else None
+    if (not isinstance(task, dict)
+            or not isinstance(task.get("goal"), str) or not task["goal"].strip()
+            or not isinstance(instructions, str)
+            or not isinstance(task.get("cwd"), str) or not task["cwd"]
+            or not isinstance(task.get("allowed_files"), list)
+            or len(task["allowed_files"]) > 200
+            or any(not isinstance(name, str) or not name for name in task["allowed_files"])
+            or not isinstance(commands, list) or len(commands) > 100
+            or any(not isinstance(argv, list) or not argv or len(argv) > 200
+                   or any(not isinstance(arg, str) for arg in argv) for argv in commands)
+            or not Path(task["cwd"]).resolve(strict=True).is_dir()):
+        raise ValueError("Worker manifest is malformed")
+    return {**task, "mandatory_instructions": instructions}
+
+
+def worker_patch_operations(task, command):
+    """Describe normalized owned operations without source diff bytes."""
+    cwd = Path(task["cwd"]).resolve(strict=True)
+    owners = owned_paths(cwd, task["allowed_files"])
+    headers = re.findall(
+        r"(?m)^\*\*\* (Add File|Update File|Delete File|Move to): (.+)$",
+        command,
+    )
+    if not headers or len(headers) > 200:
+        raise ValueError("Worker patch scope is malformed")
+    operation_names = {
+        "Add File": "add",
+        "Update File": "update",
+        "Delete File": "delete",
+        "Move to": "move",
+    }
+    operations = []
+    for kind, raw in headers:
+        path = Path(raw)
+        target = path.resolve() if path.is_absolute() else (cwd / path).resolve()
+        if not target.is_relative_to(cwd):
+            raise ValueError("Worker patch scope escapes cwd")
+        if not any(target == owner or (owner.is_dir() and target.is_relative_to(owner))
+                   for owner in owners):
+            raise ValueError("Worker patch scope is not owned")
+        operations.append({
+            "operation": operation_names[kind],
+            "path": target.relative_to(cwd).as_posix(),
+            "inside_working_directory": True,
+        })
+    return operations
+
+
+def review_worker_patch(task, operations):
+    """Ask Jev about manifest-bound structural scope, not code correctness."""
+    state = {
+        "user_goal": sanitized(task["goal"]),
+        "context_source": "verified_worker_manifest",
+        "delegation": {
+            "task_id": sanitized(task.get("task_id")),
+            "cwd": sanitized(task["cwd"]),
+            "allowed_files": [sanitized(name) for name in task["allowed_files"]],
+            "acceptance_commands": [
+                [sanitized(arg) for arg in argv]
+                for argv in task.get("acceptance_commands", [])
+            ],
+            "constraints": sanitized(task["mandatory_instructions"]),
+            "read_only": task.get("read_only") is True,
+        },
+        "patch_operations": operations,
+    }
+    questions = {"authorization": {"type": "choice", "instructions":
+        "Judge structural scope only, not code correctness or unseen file contents. "
+        "Allow only when every operation and path is explicitly authorized by the verified task. "
+        "Deletion or movement requires explicit user intent. Independent review and acceptance checks "
+        "remain responsible for implementation correctness.",
+        "criteria": {
+            "allow": "Every operation and path matches the verified task",
+            "deny": "Any operation or path is unrelated, destructive, or not explicitly requested",
+            "unclear": "The verified task does not establish the requested scope",
+        }}}
+    result = ask_jev(state, questions, timeout=5)
+    result = result if isinstance(result, dict) else {}
+    answers = result.get("answers")
+    answer = answers.get("authorization") if isinstance(answers, dict) else None
+    answer = answer if isinstance(answer, dict) else {}
+    usage = result.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    try:
+        raw_confidence = answer.get("confidence")
+        if isinstance(raw_confidence, bool):
+            raise ValueError("Boolean confidence is invalid")
+        confidence = float(raw_confidence or 0)
+        if not 0 <= confidence <= 1:
+            raise ValueError("Confidence is outside its finite range")
+    except (TypeError, ValueError, OverflowError):
+        confidence = 0
+        answer = {}
+    decision = answer.get("choice")
+    normalized = decision if decision in ("allow", "deny", "unclear") else "unavailable"
+    allowed = decision == "allow" and confidence >= 0.90
+    metadata = {
+        "context_source": "verified_worker_manifest",
+        "review_kind": "worker_patch_scope",
+        "decision": normalized,
+        "confidence": round(confidence, 3),
+        "threshold": 0.90,
+    }
+    log_metric("tool_review", tool="apply_patch", allowed=allowed,
+               session=key_for(task.get("task_id")), **metadata,
+               input_tokens=usage.get("input_tokens", 0),
+               output_tokens=usage.get("output_tokens", 0))
+    if allowed:
+        return True, "", metadata
+    return (False,
+            "Jev could not confirm the manifest-bound patch scope. "
+            f"Decision={normalized}, confidence={confidence:.2f}, required=0.90.",
+            metadata)
+
+
 def jev_allows(session, name, value, threshold=0.90, patch_scope=None):
     saved = _read(state_file(session))
     goal = saved.get("active_goal") or (saved.get("goals") or [""])[-1]
@@ -752,21 +877,16 @@ def pre_tool(event):
         # Only native patch calls can mutate the workspace; shell/MCP bypasses
         # never reach Jev as candidates for authorization.
         try:
-            task = bound_task()
+            task = verified_worker_task()
             allowed = False
             reason = "Worker tool is outside its bounded tool surface."
+            review = {"context_source": "verified_worker_manifest",
+                      "review_kind": "deterministic_worker_guard", "decision": "deny"}
             if name == "apply_patch":
                 patch = value.get("command") or value.get("patch") or value.get("input")
                 if patch_allowed(task, patch) and len(patch) <= 60000:
-                    result = ask_jev({"user_goal": clean(task["goal"], 50000),
-                                      "allowed_files": task["allowed_files"],
-                                      "proposed_patch": clean(patch, 60000)},
-                        {"authorization": {"type": "choice", "instructions":
-                            "Allow only an assigned-file edit implementing the user goal.",
-                            "criteria": {"allow": "Scoped requested edit", "deny": "Unrelated or destructive change"}}})
-                    answer = (result or {}).get("answers", {}).get("authorization", {})
-                    allowed = answer.get("choice") == "allow" and float(answer.get("confidence") or 0) >= 0.90
-                    reason = "Jev did not authorize this worker patch."
+                    operations = worker_patch_operations(task, patch)
+                    allowed, reason, review = review_worker_patch(task, operations)
                 else:
                     reason = "Patch target is outside this worker's allowed_files or read_only is set."
             elif name in ("Bash", "exec_command", "shell_command"):
@@ -774,17 +894,19 @@ def pre_tool(event):
                 reason = "Worker shell permits read commands only; use apply_patch for assigned files."
                 if value.get("shell") or value.get("login") is True:
                     allowed = False
+                review["decision"] = "allow" if allowed else "deny"
             elif name in ("update_plan", "view_image"):
                 allowed = True
+                review["decision"] = "allow"
             receipt = Path(os.environ["JEV_WORKER_MANIFEST"]).parent / "guard.jsonl"
             with receipt.open("a", encoding="utf-8") as output:
                 if os.name != "nt":
                     receipt.chmod(0o600)
-                output.write(json.dumps({"task_id": task["task_id"], "tool": name,
-                                         "allowed": allowed, "time": time.time()}) + "\n")
+                output.write(json.dumps({"task_id": task["task_id"], "tool": name[:100],
+                                         "allowed": allowed, "time": time.time(), **review}) + "\n")
             return None if allowed else deny(reason)
         except (OSError, ValueError, KeyError, TypeError):
-            return deny("Worker ownership guard failed closed.")
+            return deny("Worker manifest binding or tool input is invalid; provider review was not attempted.")
     if not auto_mode:
         if name == "Bash" and UI_RAW.search(str(value.get("command") or value.get("cmd") or "")):
             return deny("Use the Jev browser/computer action helper for UI changes.")

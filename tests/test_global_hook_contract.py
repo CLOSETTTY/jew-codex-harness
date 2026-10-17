@@ -11,6 +11,12 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 HOOK = REPO / "integrations/jev/global/codex_hook.py"
+CANVASTTY_RUNTIME = {
+    "CANVASTTY_RUNTIME_PROVIDER": "codex",
+    "CANVASTTY_RUNTIME_ADDRESS": "http://127.0.0.1:9",
+    "CANVASTTY_RUNTIME_TERMINAL_SESSION_ID": "00000000-0000-4000-8000-000000000001",
+    "CANVASTTY_RUNTIME_CAPABILITY": "synthetic-not-a-credential",
+}
 
 
 def load_hook(codex_home, state_dir):
@@ -56,6 +62,42 @@ class GlobalHookContractTests(unittest.TestCase):
             result = self.hook.pre_tool(event)
         self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
         ask.assert_called_once()
+
+    def test_canvastty_environment_does_not_bypass_jev_auto_review(self):
+        event = {"session_id": self.session, "model": "jev/auto", "tool_name": "Bash",
+                 "tool_input": {"command": "touch synthetic-output.txt"}}
+        for capability in ("", "synthetic-not-a-credential"):
+            for answer in (self.decision(), None):
+                with self.subTest(capability_present=bool(capability), unavailable=answer is None):
+                    with mock.patch.dict(os.environ, {
+                        **CANVASTTY_RUNTIME, "CANVASTTY_RUNTIME_CAPABILITY": capability,
+                        "JEV_WORKER_MANIFEST": "",
+                    }), mock.patch.object(self.hook, "ask_jev", return_value=answer) as ask:
+                        result = self.hook.pre_tool(event)
+                    self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                    ask.assert_called_once()
+
+    def test_canvastty_environment_preserves_manual_model_tool_use(self):
+        event = {"session_id": self.session, "model": "gpt-6.1-sol", "tool_name": "Bash",
+                 "tool_input": {"command": "touch synthetic-output.txt"}}
+        with mock.patch.dict(os.environ, {**CANVASTTY_RUNTIME,
+                                         "JEV_WORKER_MANIFEST": ""}), \
+                mock.patch.object(self.hook, "ask_jev") as ask:
+            self.assertIsNone(self.hook.pre_tool(event))
+        ask.assert_not_called()
+
+    def test_canvastty_environment_does_not_skip_invalid_worker_binding(self):
+        for model in ("jev/auto", "gpt-6.1-sol"):
+            with self.subTest(model=model):
+                event = {"session_id": self.session, "model": model, "tool_name": "Bash",
+                         "tool_input": {"command": "touch synthetic-output.txt"}}
+                with mock.patch.dict(os.environ, {
+                    **CANVASTTY_RUNTIME,
+                    "JEV_WORKER_MANIFEST": str(self.state / "missing-manifest.json"),
+                }), mock.patch.object(self.hook, "ask_jev") as ask:
+                    result = self.hook.pre_tool(event)
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                ask.assert_not_called()
 
     def test_named_single_file_patch_uses_bounded_scope_review(self):
         cwd = Path(self.tmp.name) / "workspace"

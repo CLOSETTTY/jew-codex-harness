@@ -93,6 +93,21 @@ SHA-256 identifies those exact saved bytes.
 
 The installer adds the global Jev Browser/Computer/Compact instructions to the profile's `AGENTS.md`. On macOS it also registers `jev-browser` when the CanvasTTY browser helper is installed; the browser broker remains optional elsewhere.
 
+## Running Codex inside CanvasTTY
+
+The same Codex hooks apply when CanvasTTY launches the configured Codex profile.
+Select `jev/auto` for automatic routing and Jev tool review. A manually selected
+model keeps ordinary Tool Use; Jev UI helpers remain a separate review path.
+CanvasTTY runtime environment variables are not proof that a native permission
+guard is active and do not disable the Jev hook or worker manifest checks.
+
+Keep CanvasTTY's own permissions and lifecycle configuration unchanged when
+checking an existing installation. Do not migrate its hooks, replace active
+services, or import a machine's entire local checkout just to enable Jev.
+The optional browser broker is separate from model routing. Offline hook tests
+do not prove native CanvasTTY enforcement or a completed client response; those
+still require the live acceptance checks above.
+
 ## Platform scope
 
 | Component | macOS | Linux | Windows |

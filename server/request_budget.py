@@ -11,7 +11,7 @@ import time
 
 
 DEFAULTS = {"connect_seconds": 15, "first_token_seconds": 60, "idle_seconds": 30,
-            "total_seconds": 600, "max_attempts": 8}
+            "total_seconds": 180, "max_attempts": 8}
 
 
 def validate_budget(value):
@@ -47,6 +47,9 @@ class RequestBudget:
     def remaining(self):
         return max(0, self.deadline - time.monotonic())
 
+    def exhausted(self):
+        return not self.remaining() or self.attempts >= self.limits["max_attempts"]
+
     def claim(self):
         if not self.remaining():
             raise BudgetExceeded("total")
@@ -67,6 +70,7 @@ class AttemptClock:
         self.phase_deadline = time.monotonic() + budget.limits["connect_seconds"]
         self.expired = None
         self.lock = threading.RLock()
+        self.wait_lock = threading.Lock()
         self.closed = False
 
     def timeout(self):
@@ -85,10 +89,20 @@ class AttemptClock:
                 readable, _, _ = select.select([self.client_socket], [], [], 0)
                 if readable and not self.client_socket.recv(1, socket.MSG_PEEK):
                     self.disconnected = True
-                if not self.disconnected and self.on_wait:
-                    self.on_wait()
             except (OSError, ValueError):
                 self.disconnected = True
+
+    def _notify_wait(self):
+        # A slow downstream write must not hold the deadline watchdog lock or
+        # accumulate a new blocked heartbeat thread on every timer tick.
+        if self.on_wait and self.wait_lock.acquire(blocking=False):
+            try:
+                self.on_wait()
+            except OSError:
+                with self.lock:
+                    self.disconnected = True
+            finally:
+                self.wait_lock.release()
 
     def _interrupt(self):
         with self.lock:
@@ -97,14 +111,16 @@ class AttemptClock:
             self._check_client()
             if not self.disconnected and time.monotonic() < min(self.budget.deadline, self.phase_deadline):
                 self._arm()
+            else:
+                if not self.disconnected:
+                    self.expired = "total" if time.monotonic() >= self.budget.deadline else self.phase
+                if self.socket is not None:
+                    try:
+                        self.socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                 return
-            if not self.disconnected:
-                self.expired = "total" if time.monotonic() >= self.budget.deadline else self.phase
-            if self.socket is not None:
-                try:
-                    self.socket.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+        self._notify_wait()
 
     def _arm(self):
         if self.timer:
@@ -121,6 +137,7 @@ class AttemptClock:
             self._arm()
 
     def before_read(self):
+        self._notify_wait()
         with self.lock:
             self._check_client()
             timeout = self.timeout()

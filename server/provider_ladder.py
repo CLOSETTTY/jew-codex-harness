@@ -293,13 +293,16 @@ class Ladder:
             return sum(max(1, len(p.get("connection_ids", []))) for p in self.providers)
         return len(self.config["gemini_connection_ids"]) + len(self.config.get("opus_connection_ids") or []) + 5
 
-    def native_route(self, tier, effort):
+    def native_route(self, tier, effort, *, excluded=()):
         if self.providers is None:
-            return {"stage": "main", "model": tier if tier == "gpt-6-astra" else self.config["main_model"], "account": None,
-                    "effort": effort, "transport": "native"}
+            choice = {"stage": "main", "model": tier if tier == "gpt-6-astra" else self.config["main_model"], "account": None,
+                      "effort": effort, "transport": "native"}
+            return None if (choice["model"], choice["account"]) in excluded else choice
         for index, provider in enumerate(self.providers):
             if provider["transport"] == "native":
-                return self._ordered_choice(index, 0, tier, effort)
+                choice = self._ordered_choice(index, 0, tier, effort)
+                if (choice["model"], choice["account"]) not in excluded:
+                    return choice
         return None
 
     def _ordered_choice(self, index, account_index, tier, effort):

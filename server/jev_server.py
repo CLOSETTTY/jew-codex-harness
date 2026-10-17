@@ -2351,7 +2351,8 @@ class Handler(BaseHTTPRequestHandler):
             status, out_kind, ctype, quota_hit, unwritten, _resets_at = self._forward(
                 payload, out_path, stream_requested, debug, marker, model, signature, effort,
                 exact_route=True)
-        exhausted = any(a.get("timeout_phase") in ("total", "max_attempts") for a in self._attempts)
+        exhausted = unwritten is not None and (self._budget.exhausted() or any(
+            a.get("timeout_phase") in ("total", "max_attempts") for a in self._attempts))
         if exhausted:
             _exhausted_requests.remember(getattr(self, "_replay_key", None))
         if unwritten is not None and getattr(self, "_validated_stream", None):
@@ -2360,7 +2361,7 @@ class Handler(BaseHTTPRequestHandler):
                                         "request_budget_exhausted" if exhausted else "upstream_response_failed")
             unwritten = None
         if unwritten is not None:
-            if any(a.get("timeout_phase") in ("total", "max_attempts") for a in self._attempts):
+            if exhausted:
                 status, ctype = 400, "application/json"
                 unwritten = b'{"error":{"type":"invalid_request_error","code":"request_budget_exhausted","message":"Request budget exhausted; start a new request or adjust request_budget."}}'
             # Every model that could have served this turn refused it, and the
@@ -2480,11 +2481,12 @@ class Handler(BaseHTTPRequestHandler):
         self._budget = getattr(self, "_budget", None) or RequestBudget(ladder.config.get("request_budget"))
         last_error = None
         needs_tool_search_history = has_tool_search_history(payload)
+        attempted_native = set()
         force_main_for_call = False
         for attempt_index in range(ladder.attempt_limit + 1):
             forced_native = force_main_for_call
             try:
-                chosen = (ladder.native_route(base_model, effort) if force_main_for_call
+                chosen = (ladder.native_route(base_model, effort, excluded=attempted_native) if force_main_for_call
                           else ladder.route(scope, base_model, effort,
                                             recover_primary=attempt_index == 0))
                 if (chosen is not None and chosen["stage"] != "exhausted"
@@ -2494,17 +2496,21 @@ class Handler(BaseHTTPRequestHandler):
                     # Capability is an explicit route declaration, not a model-
                     # name heuristic. Incompatible routes keep the native-only
                     # handoff without advancing their sticky provider state.
-                    chosen = ladder.native_route(base_model, effort)
+                    chosen = ladder.native_route(base_model, effort, excluded=attempted_native)
                     forced_native = True
             except (OSError, ValueError, RuntimeError) as exc:
                 return self._json(503, {"error": {"message": "provider ladder state unavailable",
                                                "type": type(exc).__name__}})
             if chosen is None:
+                if last_error is not None:
+                    break
                 return self._json(400, {"error": {"message":
                     "This request requires a native route; none is configured in the provider sequence"}})
             if chosen["stage"] == "exhausted":
                 break
             native = chosen.get("transport", "native" if chosen["stage"] == "main" else "omniroute") == "native"
+            if native:
+                attempted_native.add((chosen["model"], chosen["account"]))
             model = chosen["model"]
             profiles = ladder.config.get("reasoning_profiles")
             resolved = resolve_model_reasoning_effort(model, effort, profiles)
@@ -2615,7 +2621,8 @@ class Handler(BaseHTTPRequestHandler):
                   "total_ms": int((time.time() - started_at) * 1000) if started_at else None,
                   "status": status, "cache_scope": scope, "stream": stream_requested})
         remember_route_lease(scope, payload, step, decision, status)
-        exhausted = any(a.get("timeout_phase") in ("total", "max_attempts") for a in self._attempts)
+        exhausted = self._budget.exhausted() or any(
+            a.get("timeout_phase") in ("total", "max_attempts") for a in self._attempts)
         if exhausted:
             _exhausted_requests.remember(getattr(self, "_replay_key", None))
         relay = getattr(self, "_validated_stream", None)
@@ -2769,7 +2776,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Downstream proxies must not time out waiting for headers or
                 # multiply their own retries while generation is still active.
                 if not getattr(self, "_validated_stream", None):
-                    self._validated_stream = ValidatedStream(self, model)
+                    self._validated_stream = ValidatedStream(self, "jev/auto")
                 raw = read_body()
                 if len(raw) <= 8 * 1024 * 1024:
                     from provider_output import normalize_sparse_output_indices

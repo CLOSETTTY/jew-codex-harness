@@ -234,7 +234,10 @@ def _run_task(task_id):
         command.extend(["-c", 'windows.sandbox="unelevated"'])
     for section in ("mcp_servers", "plugins"):
         for name in config.get(section, {}):
-            command.extend(["-c", section + "." + json.dumps(name) + ".enabled=false"])
+            if "." in name:
+                raise ValueError("Worker cannot safely disable a configuration name containing dots")
+            # Codex splits override paths on dots; quotes become literal name characters.
+            command.extend(["-c", section + "." + name + ".enabled=false"])
     command.extend(["--output-last-message", str(answer), "-"])
     env = {**os.environ, "JEV_WORKER_MANIFEST": str(directory / "task.json"),
            "JEV_WORKER_MANIFEST_SHA256": hashlib.sha256((directory / "task.json").read_bytes()).hexdigest(),

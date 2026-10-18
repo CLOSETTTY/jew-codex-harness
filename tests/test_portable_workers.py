@@ -187,10 +187,21 @@ class PortableWorkersTest(unittest.TestCase):
             self.assertIn("--sandbox", args[0])
             self.assertIn("read-only", args[0])
             self.assertIn("jev/auto", args[0])
-            self.assertIn('mcp_servers."jev-workers".enabled=false', args[0])
+            self.assertIn('mcp_servers.jev-workers.enabled=false', args[0])
             self.assertEqual(Path(kwargs["stdout"].name).name, "events.jsonl")
             self.assertIs(kwargs["stderr"], portable.subprocess.DEVNULL)
             self.assertEqual(portable.collect(task_id)["summary"], "safe answer")
+
+    def test_dotted_configuration_name_fails_before_launch(self):
+        (self.home / "config.toml").write_text(
+            '[mcp_servers."server.with.dot"]\ncommand = "python"\n', encoding="utf-8")
+        with mock.patch.object(portable.shutil, "which", return_value="/fake/codex"), \
+             mock.patch.object(portable.subprocess, "Popen") as launch:
+            task_id = portable.submit(self.task)["task_id"]
+            launch.reset_mock()
+            portable._run(task_id)
+            launch.assert_not_called()
+            self.assertEqual(portable.status(task_id)["reason"], "worker_setup_failed")
 
     def test_mcp_loads_without_macos_dependencies_and_dispatches(self):
         with mock.patch.object(sys, "platform", "darwin"), \
